@@ -51,8 +51,9 @@ func TestZstdEncoderCreation(t *testing.T) {
 
 	encoderValues := make(chan result, goroutines)
 
-	mutex := &sync.Mutex{}
 	var encoders atomic.Int32
+
+	lock := &sync.Mutex{}
 
 	for i := 0; i < goroutines; i++ {
 		id := i
@@ -66,18 +67,18 @@ func TestZstdEncoderCreation(t *testing.T) {
 			startBarrier.Done()
 			startBarrier.Wait()
 
-			mutex.Lock()
+			lock.Lock()
 			encoder := getZstdEncoder(ZstdEncoderParams{Level: 3})
 			currentEncoders := encoders.Add(1)
-			mutex.Unlock()
+			lock.Unlock()
 
 			output := encoder.EncodeAll(buf, nil)
 			len := len(output)
 
-			mutex.Lock()
+			lock.Lock()
 			releaseEncoder(ZstdEncoderParams{Level: 3}, encoder)
 			encoders.Add(-1)
-			mutex.Unlock()
+			lock.Unlock()
 
 			encoderValues <- result{id, len, int(currentEncoders)}
 
@@ -88,6 +89,7 @@ func TestZstdEncoderCreation(t *testing.T) {
 	maxEncoersGoroutineId := 0
 	totalCompressedBytes := 0
 	totalBytes := 0
+	encodersSum := 0
 	for i := 0; i < goroutines; i++ {
 		result := <-encoderValues
 		totalCompressedBytes += result.compressedBytes
@@ -96,11 +98,15 @@ func TestZstdEncoderCreation(t *testing.T) {
 			maxEncoderValues = result.encoders
 			maxEncoersGoroutineId = result.goroutineID
 		}
+		encodersSum += result.encoders
 	}
 
+	fmt.Printf("GOMAXPROCS: %d\n", runtime.GOMAXPROCS(0))
+	fmt.Printf("Encoders: %d\n", encoders.Load())
 	fmt.Printf("Max encoders: %d, goroutine ID: %d\n", maxEncoderValues, maxEncoersGoroutineId)
 	fmt.Printf("Total compressed bytes: %d, total bytes: %d\n", totalCompressedBytes, totalBytes)
 	fmt.Printf("Compression ratio: %f\n", float64(totalCompressedBytes)/float64(totalBytes))
+	fmt.Printf("Average encoders: %f\n", float64(encodersSum)/float64(goroutines))
 
 	if maxEncoderValues > 1 {
 		t.Fatalf("Expected at most 1 encoder per GOMAXPROCS, got %d", maxEncoderValues)
