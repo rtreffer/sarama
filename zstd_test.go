@@ -2,6 +2,7 @@ package sarama
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,87 @@ func BenchmarkZstdMemoryConsumption(b *testing.B) {
 		// zstdEncMap.Delete(params)
 	}
 	runtime.GOMAXPROCS(gomaxprocsBackup)
+}
+
+func benchZstdCpuAndMemoryHighConcurrency(b *testing.B, gomaxprocs, goroutines, maxEncoders, maxIdleEncoders int) {
+	gomaxprocsBackup := runtime.GOMAXPROCS(gomaxprocs)
+	defer runtime.GOMAXPROCS(gomaxprocsBackup)
+
+	params := ZstdEncoderParams{Level: 3}
+	blocksize := 1024
+
+	releaseEncoder(params, getZstdEncoder(params)) // initialize the encoder pool
+
+	// configure the pool
+	zstdEncPool.getPool(params).runningEncoderLimit = maxEncoders
+	if maxIdleEncoders >= 0 {
+		zstdEncPool.getPool(params).maxIdleEncoders = maxIdleEncoders
+	} else {
+		zstdEncPool.getPool(params).maxIdleEncoders = math.MaxInt
+	}
+	zstdEncPool.getPool(params).reset()
+
+	// prepare the data
+	buf := make([][]byte, goroutines)
+	for i := 0; i < goroutines; i++ {
+		buf[i] = make([]byte, blocksize)
+		if i == 0 {
+			for j := 0; j < len(buf[i]); j++ {
+				buf[i][j] = byte((j / 256) + (j * 257))
+			}
+			continue
+		}
+		copy(buf[i], buf[i-1][1:])
+		buf[i][blocksize-1] = buf[i][blocksize-1] + 1
+	}
+
+	b.SetBytes(int64(blocksize) * int64(goroutines))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for run := 0; run < b.N; run++ {
+		// reset the encoder pool on each start to even out the playing field
+		zstdEncPool.getPool(params).reset()
+
+		var startBarrier sync.WaitGroup
+		startBarrier.Add(goroutines)
+
+		for i := 0; i < goroutines; i++ {
+			id := i
+			go func(id int, buf []byte) {
+				startBarrier.Done()
+				startBarrier.Wait()
+
+				encoder := getZstdEncoder(params)
+
+				_ = encoder.EncodeAll(buf, nil)
+
+				releaseEncoder(params, encoder)
+			}(id, buf[id])
+		}
+	}
+}
+
+func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCEncoderLimit(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, 1, 100, 0, -1)
+}
+
+func BenchmarkZstdCpuAndMemoryHighConcurrencyOneIdleGOMAXPROCEncoderLimit(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, 1, 100, 0, 1)
+}
+
+func BenchmarkZstdCpuAndMemoryHighConcurrencyOneIdle(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, 1, 100, 100, 1)
+}
+func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCS4GOMAXPROCEncoderLimit(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, 4, 100, 0, -1)
+}
+
+func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCS4OneIdleGOMAXPROCEncoderLimit(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, 4, 100, 0, 1)
+}
+
+func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCS4OneIdle(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, 4, 100, 100, 1)
 }
 
 // BenchmarkZstdEncoderCreation benchmarks the creation of a zstd encoders
