@@ -45,8 +45,10 @@ type zstdEncoderSettingPools sync.Map
 
 func (p *zstdEncoderPool) cleanup() {
 	now := time.Now()
+	count := len(p.idleEncoders)
+	max := p.maxIdleEncoders
 	for i, e := range p.idleEncoders {
-		if e.expire.Before(now) {
+		if count-i > max || e.expire.Before(now) {
 			continue
 		}
 		p.encoderDropIdleCount += i
@@ -98,6 +100,19 @@ func (p *zstdEncoderPool) getOutstandingEncoderLimit() int {
 func (p *zstdEncoderPool) getZstdEncoder() *zstd.Encoder {
 	p.lock.Lock()
 
+	// GOMAXPROCS can be changed at runtime, so check before create
+	outstandingLimit := p.getOutstandingEncoderLimit()
+
+	if p.outstandingEncoders >= outstandingLimit {
+		// we have reached GOMAXPROCS, let's wait until an encoder becomes available
+		p.encoderWaitCount++
+		p.waitingRoutines++
+		p.cleanup()
+		p.lock.Unlock()
+
+		return <-p.channel
+	}
+
 	// check if we have idle encoders and reuse the first one, then run cleanup
 	if len(p.idleEncoders) > 0 {
 		encoder := p.idleEncoders[0]
@@ -110,34 +125,20 @@ func (p *zstdEncoderPool) getZstdEncoder() *zstd.Encoder {
 		return encoder.encoder
 	}
 
-	// we couldn't reuse an encoder, perform cleanup
+	p.outstandingEncoders++
+	p.encoderCreationCount++
 	p.cleanup()
-
-	// GOMAXPROCS can be changed at runtime, so check before create
-	outstandingLimit := p.getOutstandingEncoderLimit()
-
-	if outstandingLimit > p.outstandingEncoders {
-		p.outstandingEncoders++
-		p.encoderCreationCount++
-		p.lock.Unlock()
-
-		encoderLevel := zstd.SpeedDefault
-		if p.params.Level != CompressionLevelDefault {
-			encoderLevel = zstd.EncoderLevelFromZstd(p.params.Level)
-		}
-		zstdEnc, _ := zstd.NewWriter(nil, zstd.WithZeroFrames(true),
-			zstd.WithEncoderLevel(encoderLevel),
-			zstd.WithEncoderConcurrency(1))
-
-		return zstdEnc
-	}
-
-	// we have reached GOMAXPROCS, let's wait until an encoder becomes available
-	p.encoderWaitCount++
-	p.waitingRoutines++
 	p.lock.Unlock()
 
-	return <-p.channel
+	encoderLevel := zstd.SpeedDefault
+	if p.params.Level != CompressionLevelDefault {
+		encoderLevel = zstd.EncoderLevelFromZstd(p.params.Level)
+	}
+	zstdEnc, _ := zstd.NewWriter(nil, zstd.WithZeroFrames(true),
+		zstd.WithEncoderLevel(encoderLevel),
+		zstd.WithEncoderConcurrency(1))
+
+	return zstdEnc
 }
 
 func (p *zstdEncoderSettingPools) getZstdEncoder(params ZstdEncoderParams) *zstd.Encoder {
@@ -151,12 +152,8 @@ func (p *zstdEncoderSettingPools) releaseEncoder(params ZstdEncoderParams, enc *
 func (p *zstdEncoderPool) releaseEncoder(enc *zstd.Encoder) {
 	p.lock.Lock()
 
-	// check if we are above GOMAXPROCS
-	// in that case we should just drop our encoder
-	// this can happen if GOMAXPROCS was reduced
-
-	outstandingLimit := runtime.GOMAXPROCS(0)
-	if outstandingLimit < p.outstandingEncoders {
+	outstandingLimit := p.getOutstandingEncoderLimit()
+	if p.outstandingEncoders > outstandingLimit {
 		p.outstandingEncoders--
 		p.encoderDropDirectCount++
 		p.cleanup()
@@ -164,36 +161,26 @@ func (p *zstdEncoderPool) releaseEncoder(enc *zstd.Encoder) {
 		return
 	}
 
-	if p.waitingRoutines == 0 {
-		// nothing is waiting so our encoder should become idle
-		p.outstandingEncoders--
-		cleanupDone := false
-		if len(p.idleEncoders) >= p.maxIdleEncoders {
-			cleanupDone = true
-			p.cleanup()
-		}
-		if len(p.idleEncoders) < p.maxIdleEncoders {
-			p.idleEncoders = append(p.idleEncoders, zstdEncoderPoolEntry{
-				encoder: enc,
-				// Our expiry is `1 + number of idle encoders` seconds
-				// This ensures that if we get a big influx of encoders (say 8) we will expire them over 9s
-				// The amortized allocations / deallocations per second are thus 1
-				expire: time.Now().Add(p.baselineTTL*time.Duration(len(p.idleEncoders)) + p.baselineTTL),
-			})
-		} else {
-			p.encoderDropDirectCount++
-		}
-		if !cleanupDone {
-			p.cleanup()
-		}
+	if p.waitingRoutines > 0 {
+		// we have waiting routines, let's share the encoder with them
+		p.encoderReuseDirectCount++
+		p.waitingRoutines--
+		p.cleanup()
 		p.lock.Unlock()
+
+		p.channel <- enc
 		return
 	}
 
-	p.encoderReuseDirectCount++
+	// nothing is waiting so our encoder should become idle
+	p.outstandingEncoders--
+	p.idleEncoders = append(p.idleEncoders, zstdEncoderPoolEntry{
+		encoder: enc,
+		// Our expiry is `1 + number of idle encoders` seconds
+		// This ensures that if we get a big influx of encoders (say 8) we will expire them over 9s
+		// The amortized allocations / deallocations per second are thus 1
+		expire: time.Now().Add(p.baselineTTL*time.Duration(len(p.idleEncoders)) + p.baselineTTL),
+	})
 	p.cleanup()
 	p.lock.Unlock()
-
-	// reshare our encoder
-	p.channel <- enc
 }

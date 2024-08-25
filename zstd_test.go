@@ -32,23 +32,27 @@ func BenchmarkZstdMemoryConsumption(b *testing.B) {
 	runtime.GOMAXPROCS(gomaxprocsBackup)
 }
 
-func benchZstdCpuAndMemoryHighConcurrency(b *testing.B, gomaxprocs, goroutines, maxEncoders, maxIdleEncoders int) {
+func benchZstdCpuAndMemoryHighConcurrency(b *testing.B, allocs bool, gomaxprocs, goroutines, maxEncoders, maxIdleEncoders int) {
 	gomaxprocsBackup := runtime.GOMAXPROCS(gomaxprocs)
 	defer runtime.GOMAXPROCS(gomaxprocsBackup)
 
-	params := ZstdEncoderParams{Level: 3}
-	blocksize := 1024
+	if b.N < goroutines {
+		goroutines = b.N
+	}
+	runs := (b.N / goroutines) + 1
+	b.N = goroutines * (runs - 1)
 
-	releaseEncoder(params, getZstdEncoder(params)) // initialize the encoder pool
+	params := ZstdEncoderParams{Level: 3}
+	blocksize := 2048
 
 	// configure the pool
+	zstdEncPool.getPool(params).reset()
 	zstdEncPool.getPool(params).runningEncoderLimit = maxEncoders
 	if maxIdleEncoders >= 0 {
 		zstdEncPool.getPool(params).maxIdleEncoders = maxIdleEncoders
 	} else {
 		zstdEncPool.getPool(params).maxIdleEncoders = math.MaxInt
 	}
-	zstdEncPool.getPool(params).reset()
 
 	// prepare the data
 	buf := make([][]byte, goroutines)
@@ -64,15 +68,33 @@ func benchZstdCpuAndMemoryHighConcurrency(b *testing.B, gomaxprocs, goroutines, 
 		buf[i][blocksize-1] = buf[i][blocksize-1] + 1
 	}
 
-	b.SetBytes(int64(blocksize) * int64(goroutines))
-	b.ReportAllocs()
-	b.ResetTimer()
-	for run := 0; run < b.N; run++ {
-		// reset the encoder pool on each start to even out the playing field
-		zstdEncPool.getPool(params).reset()
+	b.SetBytes(int64(blocksize))
+	runtime.GC()
+
+	encodersPrerun := zstdEncPool.getPool(params).encoderCreationCount
+	encoderPrerunWaits := zstdEncPool.getPool(params).encoderWaitCount
+	encoderReuse := zstdEncPool.getPool(params).encoderReuseDirectCount + zstdEncPool.getPool(params).encoderReuseIdleCount
+
+	var encoderValues = make(chan int, goroutines)
+	sumMaxEncoders := 0
+	lock := &sync.Mutex{}
+
+	for run := 0; run <= runs; run++ {
+		if run == 1 {
+			sumMaxEncoders = 0
+			encodersPrerun = zstdEncPool.getPool(params).encoderCreationCount
+			encoderPrerunWaits = zstdEncPool.getPool(params).encoderWaitCount
+			encoderReuse = zstdEncPool.getPool(params).encoderReuseDirectCount + zstdEncPool.getPool(params).encoderReuseIdleCount
+			if allocs {
+				b.ReportAllocs()
+			}
+			b.ResetTimer()
+		}
 
 		var startBarrier sync.WaitGroup
 		startBarrier.Add(goroutines)
+
+		var encoderCount atomic.Int32
 
 		for i := 0; i < goroutines; i++ {
 			id := i
@@ -81,36 +103,116 @@ func benchZstdCpuAndMemoryHighConcurrency(b *testing.B, gomaxprocs, goroutines, 
 				startBarrier.Wait()
 
 				encoder := getZstdEncoder(params)
+				lock.Lock()
+				encoderId := encoderCount.Add(1)
+				lock.Unlock()
 
 				_ = encoder.EncodeAll(buf, nil)
 
+				lock.Lock()
 				releaseEncoder(params, encoder)
+				encoderCount.Add(-1)
+				lock.Unlock()
+
+				encoderValues <- int(encoderId)
 			}(id, buf[id])
 		}
+
+		maxEncoders := 0
+		for i := 0; i < goroutines; i++ {
+			encoderCount := <-encoderValues
+			if encoderCount > maxEncoders {
+				maxEncoders = int(encoderCount)
+			}
+		}
+		sumMaxEncoders += maxEncoders
 	}
+
+	b.StopTimer()
+
+	runtime.GC()
+
+	createdEncoders := zstdEncPool.getPool(params).encoderCreationCount
+	b.ReportMetric(float64(createdEncoders-encodersPrerun)/float64(b.N), "new/op")
+	encoderWaits := zstdEncPool.getPool(params).encoderWaitCount
+	b.ReportMetric(float64(encoderWaits-encoderPrerunWaits)/float64(b.N), "waits/op")
+	encoderReuses := zstdEncPool.getPool(params).encoderReuseDirectCount + zstdEncPool.getPool(params).encoderReuseIdleCount
+	b.ReportMetric(float64(encoderReuses-encoderReuse)/float64(b.N), "reuses/op")
+	b.ReportMetric(float64(sumMaxEncoders)/float64(runs), "open_encs")
 }
 
 func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCEncoderLimit(b *testing.B) {
-	benchZstdCpuAndMemoryHighConcurrency(b, 1, 100, 0, -1)
+	benchZstdCpuAndMemoryHighConcurrency(b, false, 1, 1000, 0, -1)
 }
 
-func BenchmarkZstdCpuAndMemoryHighConcurrencyOneIdleGOMAXPROCEncoderLimit(b *testing.B) {
-	benchZstdCpuAndMemoryHighConcurrency(b, 1, 100, 0, 1)
+func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCEncoderLimitAlloc(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, true, 1, 1000, 0, -1)
 }
 
-func BenchmarkZstdCpuAndMemoryHighConcurrencyOneIdle(b *testing.B) {
-	benchZstdCpuAndMemoryHighConcurrency(b, 1, 100, 100, 1)
+func BenchmarkZstdCpuAndMemoryHighConcurrencyIdle1GOMAXPROCEncoderLimit(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, false, 1, 1000, 0, 1)
+}
+
+func BenchmarkZstdCpuAndMemoryHighConcurrencyIdle1GOMAXPROCEncoderLimitAlloc(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, true, 1, 1000, 0, 1)
+}
+
+func BenchmarkZstdCpuAndMemoryHighConcurrencyIdle1(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, false, 1, 1000, 1000, 1)
+}
+func BenchmarkZstdCpuAndMemoryHighConcurrencyIdle1Alloc(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, true, 1, 1000, 1000, 1)
+}
+func BenchmarkZstdCpuAndMemoryHighConcurrencyIdleMaxGOMAXPROCEncoderLimit(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, false, 1, 1000, 0, 1000)
+}
+
+func BenchmarkZstdCpuAndMemoryHighConcurrencyIdleMaxGOMAXPROCEncoderLimitAlloc(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, true, 1, 1000, 0, 1000)
+}
+
+func BenchmarkZstdCpuAndMemoryHighConcurrencyIdleMax(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, false, 1, 1000, 1000, 1000)
+}
+func BenchmarkZstdCpuAndMemoryHighConcurrencyIdleMaxAlloc(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, true, 1, 1000, 1000, 1000)
 }
 func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCS4GOMAXPROCEncoderLimit(b *testing.B) {
-	benchZstdCpuAndMemoryHighConcurrency(b, 4, 100, 0, -1)
+	benchZstdCpuAndMemoryHighConcurrency(b, false, 4, 1000, 0, -1)
 }
 
-func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCS4OneIdleGOMAXPROCEncoderLimit(b *testing.B) {
-	benchZstdCpuAndMemoryHighConcurrency(b, 4, 100, 0, 1)
+func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCS4GOMAXPROCEncoderLimitAlloc(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, true, 4, 1000, 0, -1)
 }
 
-func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCS4OneIdle(b *testing.B) {
-	benchZstdCpuAndMemoryHighConcurrency(b, 4, 100, 100, 1)
+func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCS4Idle1GOMAXPROCEncoderLimit(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, false, 4, 1000, 0, 1)
+}
+func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCS4Idle1GOMAXPROCEncoderLimitAlloc(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, true, 4, 1000, 0, 1)
+}
+
+func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCS4Idle1(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, false, 4, 1000, 1000, 1)
+}
+func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCS4Idle1Alloc(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, true, 4, 1000, 1000, 1)
+}
+
+func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCS4IdleMaxGOMAXPROCEncoderLimit(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, false, 4, 1000, 0, 1000)
+}
+
+func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCS4IdleMaxGOMAXPROCEncoderLimitAlloc(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, true, 4, 1000, 0, 1000)
+}
+
+func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCS4IdleMax(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, false, 4, 1000, 1000, 1000)
+}
+
+func BenchmarkZstdCpuAndMemoryHighConcurrencyGOMAXPROCS4IdleMaxAlloc(b *testing.B) {
+	benchZstdCpuAndMemoryHighConcurrency(b, true, 4, 1000, 1000, 1000)
 }
 
 // BenchmarkZstdEncoderCreation benchmarks the creation of a zstd encoders
@@ -120,7 +222,7 @@ func TestZstdEncoderCreation(t *testing.T) {
 	gomaxprocsBackup := runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(gomaxprocsBackup)
 
-	goroutines := 500
+	goroutines := 1000
 	blockSize := 1024
 	var startBarrier sync.WaitGroup
 	startBarrier.Add(goroutines)
@@ -149,8 +251,8 @@ func TestZstdEncoderCreation(t *testing.T) {
 			startBarrier.Done()
 			startBarrier.Wait()
 
-			lock.Lock()
 			encoder := getZstdEncoder(ZstdEncoderParams{Level: 3})
+			lock.Lock()
 			currentEncoders := encoders.Add(1)
 			lock.Unlock()
 
