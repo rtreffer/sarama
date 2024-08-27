@@ -1,14 +1,12 @@
 package sarama
 
 import (
+	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/klauspost/compress/zstd"
 )
-
-// zstdMaxBufferedEncoders maximum number of not-in-use zstd encoders
-// If the pool of encoders is exhausted then new encoders will be created on the fly
-const zstdMaxBufferedEncoders = 1
 
 type ZstdEncoderParams struct {
 	Level int
@@ -20,35 +18,63 @@ var zstdDecMap sync.Map
 
 var zstdAvailableEncoders sync.Map
 
+var zstdCheckedOutEncoders atomic.Int32
+var zstdMutex = &sync.Mutex{}
+var zstdEncoderReturned = sync.NewCond(zstdMutex)
+
 func getZstdEncoderChannel(params ZstdEncoderParams) chan *zstd.Encoder {
 	if c, ok := zstdAvailableEncoders.Load(params); ok {
 		return c.(chan *zstd.Encoder)
 	}
-	c, _ := zstdAvailableEncoders.LoadOrStore(params, make(chan *zstd.Encoder, zstdMaxBufferedEncoders))
+	limit := runtime.GOMAXPROCS(0)
+	c, _ := zstdAvailableEncoders.LoadOrStore(params, make(chan *zstd.Encoder, limit))
 	return c.(chan *zstd.Encoder)
 }
 
+func newZstdEncoder(params ZstdEncoderParams) *zstd.Encoder {
+	encoderLevel := zstd.SpeedDefault
+	if params.Level != CompressionLevelDefault {
+		encoderLevel = zstd.EncoderLevelFromZstd(params.Level)
+	}
+	zstdEnc, _ := zstd.NewWriter(nil, zstd.WithZeroFrames(true),
+		zstd.WithEncoderLevel(encoderLevel),
+		zstd.WithEncoderConcurrency(1))
+	return zstdEnc
+}
+
 func getZstdEncoder(params ZstdEncoderParams) *zstd.Encoder {
+
+	zstdMutex.Lock()
+	defer zstdMutex.Unlock()
+
+	limit := runtime.GOMAXPROCS(0)
+	for zstdCheckedOutEncoders.Load() >= int32(limit) {
+		zstdEncoderReturned.Wait()
+		limit = runtime.GOMAXPROCS(0)
+	}
+
+	zstdCheckedOutEncoders.Add(1)
+
 	select {
 	case enc := <-getZstdEncoderChannel(params):
 		return enc
 	default:
-		encoderLevel := zstd.SpeedDefault
-		if params.Level != CompressionLevelDefault {
-			encoderLevel = zstd.EncoderLevelFromZstd(params.Level)
-		}
-		zstdEnc, _ := zstd.NewWriter(nil, zstd.WithZeroFrames(true),
-			zstd.WithEncoderLevel(encoderLevel),
-			zstd.WithEncoderConcurrency(1))
-		return zstdEnc
+		return newZstdEncoder(params)
 	}
 }
 
 func releaseEncoder(params ZstdEncoderParams, enc *zstd.Encoder) {
+	zstdMutex.Lock()
+
+	zstdCheckedOutEncoders.Add(-1)
+	zstdEncoderReturned.Signal()
+
 	select {
 	case getZstdEncoderChannel(params) <- enc:
 	default:
 	}
+
+	zstdMutex.Unlock()
 }
 
 func getDecoder(params ZstdDecoderParams) *zstd.Decoder {
